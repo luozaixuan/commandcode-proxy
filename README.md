@@ -86,7 +86,7 @@ commandcode/
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt; `false` disables → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
-| `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
+| `CC_STREAM_IDLE_MS` | `300000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
 | `CC_UPSTREAM_RETRY_MAX` | `2` | Retries for upstream disconnects **before any byte is written downstream**; `0` disables; see [Upstream transient retry](#upstream-transient-retry) |
 | `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
@@ -345,7 +345,7 @@ Produced by the proxy itself:
 | `401` | API key missing / malformed (must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
 | `404` | Unknown path |
 | `413` | Body exceeds `CC_MAX_BODY_MB` (connection kept alive and drained, not reset) |
-| `429` | Zero output tokens, stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
+| `429` | Zero output tokens, stream idle timeout (300s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
 | `502` | CC upstream error (connection-level failures such as `fetch failed` also land here) |
 | `503` | `CC_MAX_INFLIGHT` is set and the in-flight cap is exceeded (`type: server_busy`) |
 
@@ -465,7 +465,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
 | **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — so they cannot contradict each other ("fingerprint says win32, environment says linux"), and the host's real platform, Node version and cwd are never handed upstream |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
-| **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
+| **Stream Timeout** | 300s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
 | **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
 | **Upstream Abort** | `AbortController` on client disconnect + all error paths |
@@ -596,17 +596,17 @@ Two upstream read idle watchdogs; on expiry the proxy returns `429` (with `retry
 
 | Env var | Default | Applies to |
 |---|---|---|
-| `CC_STREAM_IDLE_MS` | `30000` | Streaming requests |
+| `CC_STREAM_IDLE_MS` | `300000` | Streaming requests |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming requests |
 
 **Semantics**: they measure only the time spent waiting inside `reader.read()`, reset on every received chunk — **not the total request duration**. As long as upstream keeps emitting, the watchdog never fires, even for a request that has been running for tens of minutes.
 
-**The defaults differ from the official CLI, and that is a known trade-off** ([#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)): the official CLI has **no** upstream idle timeout at all — deobfuscating `command-code@1.50.0` shows every `createApiClient({ baseUrl })` call site passes no `timeout`, and 700+ second stalls complete successfully. This proxy keeps 30 s to catch genuinely dead connections; the cost is that a reasoning model's long prefill/first-token stall can be killed.
+**The defaults differ from the official CLI, and that is a known trade-off** ([#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)): the official CLI has **no** upstream idle timeout at all — deobfuscating `command-code@1.50.0` shows every `createApiClient({ baseUrl })` call site passes no `timeout`, and 700+ second stalls complete successfully. This proxy keeps a 300 s (5 min) watchdog to catch genuinely dead connections; a reasoning model's long prefill/first-token stall (routinely tens of seconds) now survives, at the cost of noticing a genuinely dead connection only after 5 minutes.
 
-If you see `429 Response timeout` or `zero output tokens` where the log shows `elapsedMs ≈ 30000` and `bytesReceived = 0`, the watchdog killed a healthy stall — raise it:
+If you see `429 Response timeout` or `zero output tokens` where the log shows `elapsedMs ≈ 300000` and `bytesReceived = 0`, the watchdog killed a healthy stall — raise it further:
 
 ```bash
-CC_STREAM_IDLE_MS=300000 npm start      # 5 minutes
+CC_STREAM_IDLE_MS=600000 npm start      # 10 minutes
 ```
 
 > ⚠️ A false kill costs more than one failed request: the abort returns `429 + retry_after`, the SDK retries automatically, and a retry **resends the entire context** — so each false kill re-pays the full prefill on long conversations.
@@ -710,7 +710,7 @@ location /v1/ {
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_buffering off;
-    proxy_read_timeout 300s;   # must exceed the 30s stream idle timeout
+    proxy_read_timeout 600s;   # must exceed the 300s stream idle timeout
 }
 ```
 

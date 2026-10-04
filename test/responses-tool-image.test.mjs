@@ -61,6 +61,31 @@ test('带图的工具结果：图片挂在紧随其后的 user 消息上（对�
   } finally { await s.close(); }
 });
 
+test('并行 tool_call 的图片集中放到所有 tool_result 之后（不打断配对）', async () => {
+  const s = await setup();
+  try {
+    // 复刻真机事故：并行两个读图 tool_call，output 都带图。旧实现把图片 user 消息
+    // 紧跟各自的 tool_result 插入，夹在两条 tool_result 之间打断配对 —— 上游报
+    // "Tool result is missing for tool call ..."
+    const input = [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '并行看两张图' }] },
+      { type: 'function_call', call_id: 'call_a', name: 'screenshot', arguments: '{}' },
+      { type: 'function_call', call_id: 'call_b', name: 'screenshot', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_a', output: [{ type: 'input_image', image_url: fakePng(1000) }] },
+      { type: 'function_call_output', call_id: 'call_b', output: [{ type: 'input_image', image_url: fakePng(1000) }] },
+    ];
+    await s.proxy.post('/v1/responses', { model: 'm', input }, AUTH);
+    const msgs = wire(s);
+    assert.equal(msgs.map(m => m.role).join(','), 'user,assistant,tool,tool,user',
+      '两条 tool_result 必须相邻，图片 user 消息只能排在全部 tool_result 之后');
+    assert.deepEqual(msgs.find(m => m.role === 'assistant').content
+      .filter(c => c.type === 'tool-call').map(c => c.toolCallId), ['call_a', 'call_b']);
+    assert.deepEqual(msgs.filter(m => m.role === 'tool').map(t => t.content[0].toolCallId),
+      ['call_a', 'call_b'], 'tool_call 与 tool_result 的 id 配对不能断');
+    assert.equal(imageParts(msgs).length, 2, '两张图都还要发出');
+  } finally { await s.close(); }
+});
+
 test('纯文本工具输出行为不变（回归）', async () => {
   const s = await setup();
   try {

@@ -232,13 +232,14 @@ const MAX_BODY_SIZE = (() => {
   return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
 })();
 // 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
-// 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——
-// 官方 CLI 对上游没有任何 idle timeout（反编译 command-code@1.50.0 已验证，
-// createApiClient 调用点均未传 timeout），合法的长思考停顿可达数百秒，
-// 遇到推理模型被 30s 误杀 / 触发 429 重试放大时，调大这两个值即可。
+// 不是整个请求的总时长。流式默认 300s —— 推理模型首字前的合法停顿可达数十秒
+// （实测上游只发 {"type":"start"} 后静默 >30s），30s 误杀一次下游就要 429 重试
+// 并完整重发上下文，代价远高于多等。官方 CLI 对上游没有任何 idle timeout
+// （反编译 command-code@1.50.0 已验证，createApiClient 调用点均未传 timeout），
+// 仍可用环境变量覆盖。
 const STREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
-  return Number.isFinite(ms) && ms > 0 ? ms : 30000;   // 默认 30s — 流式无新数据中断
+  return Number.isFinite(ms) && ms > 0 ? ms : 300000;   // 默认 300s — 流式无新数据中断
 })();
 const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_NONSTREAM_IDLE_MS ?? '', 10);
@@ -2876,6 +2877,22 @@ function convertResponsesToChat(respReq) {
   // Responses 把 reasoning / message / function_call 拆成并列 item，
   // Chat 要求它们挂在同一条 assistant 消息上，故先累积再冲刷。
   let pending = null;
+  // 并行 tool_call 的图片必须集中放在所有 tool_result 之后：CC/Anthropic 要求
+  // tool_result 紧跟 tool_use，若图片 user 消息插在多个 tool_result 之间，会打断
+  // 配对 —— 上游报 "Tool result is missing for tool call ..."。
+  // 单个 tool_call 带图时图片本就在序列末尾，不受影响；并行多个都带图时才触发。
+  let pendingToolImages = [];
+  const flushToolImages = () => {
+    if (!pendingToolImages.length) return;
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: '[images returned by tool calls]' },
+        ...pendingToolImages,
+      ],
+    });
+    pendingToolImages = [];
+  };
   const ensurePending = () => (pending = pending || { role: 'assistant', content: null, tool_calls: [] });
   const flushPending = () => {
     if (!pending) return;
@@ -2892,13 +2909,16 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
+      const _itemType = item.type ?? (item.role ? 'message' : undefined);
+      // 非 function_call_output 的 item 打断了 tool_result 序列，先把累积的图片 flush
+      if (_itemType !== 'function_call_output') flushToolImages();
       // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
       // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
       // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
       // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
       // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
       // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
-      switch (item.type ?? (item.role ? 'message' : undefined)) {
+      switch (_itemType) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2935,17 +2955,14 @@ function convertResponsesToChat(respReq) {
           const { text, images } = splitToolOutput(item.output);
           messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
           if (images.length) {
-            log('info', 'Hoisted tool-output images to user message', {
-              count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
+            log('info', 'Deferred tool-output images (batched after tool results)', {
+              call_id: item.call_id, count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
             });
-            // content 走 image_url 形态，交给 buildCcRequest 里已验证的 user 图片分支转成 CC 的 {type:'image',image,mimeType}
-            messages.push({
-              role: 'user',
-              content: [
-                { type: 'text', text: '[image returned by tool call]' },
-                ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
-              ],
-            });
+            // 不立即 push：并行 tool_call 的图片统一累积，由 flushToolImages() 放到所有
+            // tool_result 之后。content 走 image_url 形态，交给 buildCcRequest 的 user 图片分支转换。
+            pendingToolImages.push(
+              ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
+            );
           }
           break;
         }
@@ -2957,6 +2974,7 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+  flushToolImages();
 
   // 统一裁剪工具截图（此时所有 item 都已转成 chat 形态，按顺序处理最直观）
   trimToolImages(messages);

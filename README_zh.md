@@ -86,7 +86,7 @@ commandcode/
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
-| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
+| `CC_STREAM_IDLE_MS` | `300000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
 | `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
 | `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 重试退避基数（毫秒），实际退避 = base × 尝试序号 |
@@ -340,7 +340,7 @@ curl http://127.0.0.1:3050/v1/responses \
 | `401` | 缺 API Key / 格式不对（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入）|
 | `404` | 路径不存在 |
 | `413` | 请求体超过 `CC_MAX_BODY_MB`（连接保持可排空，不会直接 reset）|
-| `429` | 零输出 token、流空闲超时（30s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
+| `429` | 零输出 token、流空闲超时（300s 流式 / 90s 非流式）、或上游限流映射 —— 都带 `Retry-After`，SDK 自动退避重试；连续 3 次超时后提示压缩上下文 |
 | `502` | CC 上游错误（`fetch failed` 这类连接层失败也走这里）|
 | `503` | 开了 `CC_MAX_INFLIGHT` 且超过在途上限（`type: server_busy`）|
 
@@ -460,7 +460,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
-| **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
+| **流式超时保护** | 流式 300s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
 | **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
@@ -592,7 +592,7 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 | 环境变量 | 默认 | 作用于 |
 |---|---|---|
-| `CC_STREAM_IDLE_MS` | `30000` | 流式请求 |
+| `CC_STREAM_IDLE_MS` | `300000` | 流式请求 |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式请求 |
 
 **语义**：只计「`reader.read()` 的等待时间」，每收到一个 chunk 就重置 —— **不是整个请求的总时长**。
@@ -600,13 +600,13 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 **默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
 官方 CLI 对上游**没有任何** idle timeout —— 反编译 `command-code@1.50.0` 可见所有 `createApiClient({ baseUrl })` 调用点都未传 `timeout`，实测 700+ 秒的停顿可正常完成。
-本代理保留 30s 是为了兜住真正死掉的连接；代价是**推理模型的长思考停顿可能被误杀**。
+本代理保留 300s（5 分钟）看门狗兜住真正死掉的连接；推理模型的正常长思考停顿（数十秒级）不再被误杀，代价是真正死掉的连接要 5 分钟后才会被察觉。
 
-若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，
-说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 调大即可：
+若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 300000`、`bytesReceived = 0`，
+说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 可进一步调大：
 
 ```bash
-CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
+CC_STREAM_IDLE_MS=600000 npm start      # 10 分钟
 ```
 
 > ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
@@ -706,7 +706,7 @@ location /v1/ {
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_buffering off;
-    proxy_read_timeout 300s;   # 需大于 30s 的流空闲超时
+    proxy_read_timeout 600s;   # 需大于 300s 的流空闲超时
 }
 ```
 

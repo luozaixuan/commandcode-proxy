@@ -651,6 +651,23 @@ CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
 > **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
 > `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
 
+## tool-call / tool-result 配对修复
+
+CC/Anthropic 要求每个 `tool-call` 的 `tool-result` **紧跟其后**（issue #15 与 PR #62 都栽在这条规则上），
+违反时上游直接拒绝：`Tool result is missing for tool call <id>`。
+
+客户端历史可能违反它 —— 最常见的是**工具执行被中断**（用户中止、流被掐断、进程被杀）：历史里留下
+无人应答的 tool-call，而客户端每轮都会完整重发历史，于是**该会话之后每次请求都失败**。
+
+代理在转发前对 wire 消息做最小修复：
+
+- 被其他内容隔开的本轮 `tool-result` 移回 tool-result 序列内；
+- 无人应答的 `tool-call` 补一条占位 result
+  `[tool result missing: the tool call was interrupted or never completed]`，让会话能继续而不是每轮都失败；
+- 配对完好的历史零改动。
+
+排查用日志：`Synthesized placeholder tool results for unanswered tool calls`（含 `count` / `toolCallIds`）。
+
 ## 内存与部署
 
 > 数据来自 [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) 的实测复现（Node v24，loopback mock 上游）。

@@ -632,6 +632,62 @@ function buildCcRequest(openaiReq) {
     return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
+  // ── tool-call ↔ tool-result 配对修复 ──
+  // CC/Anthropic 上游硬性要求每个 tool-call 的 tool-result **紧跟其后**（PR #62 /
+  // issue #15 都栽在这条规则上）。客户端历史可能违反它：被中断/取消的工具执行
+  // （Codex 中止、流被掐断）会留下无人应答的 tool-call，之后整条会话的每一次请求
+  // 都被上游拒绝："Tool result is missing for tool call ..."。这里做最小修复 ——
+  // 把同一轮里错位的 result 移回 assistant 之后，缺的补占位；历史正常时零改动。
+  for (let i = 0; i < ccMessages.length; i++) {
+    const msg = ccMessages[i];
+    if (msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
+    const calls = msg.content.filter(p => p && p.type === 'tool-call');
+    if (!calls.length) continue;
+    const callIds = new Set(calls.map(c => c.toolCallId).filter(Boolean));
+
+    // 紧跟 assistant 的一串 tool 消息 = 本轮已有的 result
+    let runEnd = i + 1;
+    while (runEnd < ccMessages.length && ccMessages[runEnd].role === 'tool') runEnd++;
+    const answered = new Set();
+    for (let j = i + 1; j < runEnd; j++) {
+      for (const p of ccMessages[j].content || []) {
+        if (p && p.type === 'tool-result' && p.toolCallId) answered.add(p.toolCallId);
+      }
+    }
+    // 本轮 result 若被其他消息隔开（如夹在后续 user 消息之后），移到 run 内
+    for (let k = runEnd; k < ccMessages.length; k++) {
+      const m = ccMessages[k];
+      if (m.role === 'assistant') break;
+      if (m.role !== 'tool' || !Array.isArray(m.content)) continue;
+      if (!m.content.some(p => p && p.type === 'tool-result' && callIds.has(p.toolCallId))) continue;
+      ccMessages.splice(k, 1);
+      ccMessages.splice(runEnd, 0, m);
+      for (const p of m.content) {
+        if (p && p.type === 'tool-result' && p.toolCallId) answered.add(p.toolCallId);
+      }
+      runEnd++; k--;
+    }
+    // 无人应答的 tool-call：补占位 result，否则整条请求被上游 400 拒绝
+    const missing = calls.filter(c => c.toolCallId && !answered.has(c.toolCallId));
+    if (missing.length) {
+      ccMessages.splice(runEnd, 0, ...missing.map(c => ({
+        role: 'tool',
+        content: [{
+          type: 'tool-result',
+          toolCallId: c.toolCallId,
+          toolName: c.toolName || '',
+          output: { type: 'text', value: '[tool result missing: the tool call was interrupted or never completed]' },
+        }],
+      })));
+      runEnd += missing.length;
+      log('warn', 'Synthesized placeholder tool results for unanswered tool calls', {
+        count: missing.length,
+        toolCallIds: missing.map(c => c.toolCallId),
+      });
+    }
+    i = runEnd - 1;   // 跳过本轮（含新补的占位）
+  }
+
   // 缓存断点：system 是块数组，断点可以原样留在 system 上（CLI 的 systemSections[].cache 同义）。
   // 客户端已在任意消息块 / system 块上打过断点就保留；否则若给了 OpenAI 系的 prompt_cache_key，
   // 把断点落在 system 最后一块 —— 缓存按前缀计算，system 正是最前的那段前缀。

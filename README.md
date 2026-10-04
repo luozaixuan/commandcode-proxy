@@ -655,6 +655,25 @@ CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
 > `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
 > reported as before).
 
+## Tool-call / Tool-result Repair
+
+CC/Anthropic requires every `tool-call` to be **immediately followed by its `tool-result`** — the rule behind
+issue #15 and PR #62; a violation is rejected with `Tool result is missing for tool call <id>`.
+
+Client histories can violate it. The common case is an **interrupted tool execution** (user aborts, the stream is
+cut, the app is killed): the history keeps an unanswered `tool-call`, and since clients resend the whole history
+every turn, **every subsequent request of that session fails**.
+
+Before forwarding, the proxy repairs the wire messages:
+
+- a `tool-result` of the current turn that ended up behind other content is moved back into the tool-result run;
+- a `tool-call` nobody answered gets a placeholder result
+  `[tool result missing: the tool call was interrupted or never completed]`, so the session recovers instead of
+  failing on every turn;
+- well-formed histories are left untouched.
+
+Log to look for: `Synthesized placeholder tool results for unanswered tool calls` (`count` / `toolCallIds`).
+
 ## Memory & Deployment
 
 > Measurements reproduced from [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) (Node v24, loopback mock upstream).
